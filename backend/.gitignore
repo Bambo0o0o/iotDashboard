@@ -1,0 +1,10 @@
+# Node dependencies (ป้องกันอัปโหลดโฟลเดอร์นี้)
+node_modules/
+
+# Environment variables (ป้องกันอัปโหลดไฟล์ลับ/รหัสผ่าน)
+.env
+.env.local
+
+# Build output
+dist/
+build/
