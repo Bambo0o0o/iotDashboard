@@ -15,9 +15,21 @@ const { ReadlineParser } = require('@serialport/parser-readline');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
 
-app.use(cors());
+// --- CORS & Environment Setup ---
+const FRONTEND_URL = process.env.FRONTEND_URL || '*';
+
+const io = new Server(server, { 
+  cors: { 
+    origin: FRONTEND_URL,
+    methods: ["GET", "POST"]
+  } 
+});
+
+app.use(cors({
+  origin: FRONTEND_URL,
+  credentials: true
+}));
 app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'default_secret';
@@ -130,7 +142,7 @@ app.get('/api/download-csv', async (req, res) => {
   }
 });
 
-// [ส่วนแก้ไข] Update Settings & Send Command to ESP32 พร้อม Drain Buffer
+// Update Settings & Send Command to ESP32 พร้อม Drain Buffer
 app.post('/api/settings', async (req, res) => {
   try {
     const { userId, saveInterval } = req.body;
@@ -292,8 +304,9 @@ io.on('connection', (socket) => {
   console.log('⚡ Client Connected:', socket.id);
 });
 
-const PORT = 5000;
-server.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
+// Dynamic Port Allocation (สอดคล้องกับข้อกำหนดของ Render และบริการ Cloud)
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 
 // Static port connection for UART communication with ESP32-S3
