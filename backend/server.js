@@ -1,6 +1,6 @@
 /// ==========================================
 // File: backend/server.js
-// IoT Dashboard Backend Server (Express + Socket.IO + MongoDB + SerialPort)
+// IoT Dashboard Backend Server (Express + Socket.IO + MongoDB + Alert System)
 // ==========================================
 require('dotenv').config();
 
@@ -20,9 +20,19 @@ const io = new Server(server, { cors: { origin: '*' } });
 app.use(cors());
 app.use(express.json());
 
-const JWT_SECRET = process.env.JWT_SECRET || 'default_secret';
+// --- Security & Environment Variable Verification ---
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.warn('⚠️ Warning: JWT_SECRET is not defined in .env! Using temporary fallback secret.');
+}
+const ACTIVE_JWT_SECRET = JWT_SECRET || 'default_secret';
 
-mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/dashboard_db')
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/dashboard_db';
+if (!process.env.MONGO_URI) {
+  console.warn('⚠️ Warning: MONGO_URI is not defined in .env! Using local MongoDB fallback.');
+}
+
+mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ MongoDB Connected successfully!'))
   .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
@@ -71,7 +81,7 @@ app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   const user = await User.findOne({ username });
   if (user && await bcrypt.compare(password, user.password)) {
-    const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET);
+    const token = jwt.sign({ userId: user._id, username: user.username }, ACTIVE_JWT_SECRET);
     res.json({ token, username: user.username, userId: user._id });
   } else {
     res.status(401).json({ error: 'Invalid Credentials' });
@@ -82,12 +92,38 @@ app.get('/api/me', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, ACTIVE_JWT_SECRET);
     res.json({ userId: decoded.userId, username: decoded.username, token });
   } catch (err) {
     res.status(401).json({ error: 'Invalid token' });
   }
 });
+
+// --- Helper Function: Alert Checking System ---
+function checkSensorAlerts(payload) {
+  const alerts = [];
+
+  // 1. ตรวจสอบแรงดันไฟฟ้า (Voltage Alert)
+  if (payload.voltage > 3.0) {
+    alerts.push({ type: 'WARNING', sensor: 'voltage', message: `HIGH VOLTAGE DETECTED: ${payload.voltage.toFixed(2)}V (Threshold > 3.0V)` });
+  } else if (payload.voltage < 0.5 && payload.voltage > 0) {
+    alerts.push({ type: 'WARNING', sensor: 'voltage', message: `LOW VOLTAGE DETECTED: ${payload.voltage.toFixed(2)}V (Threshold < 0.5V)` });
+  }
+
+  // 2. ตรวจสอบระดับแสง LDR (Light Alert)
+  if (payload.ldr > 3500) {
+    alerts.push({ type: 'INFO', sensor: 'ldr', message: `BRIGHT LIGHT DETECTED: LDR value ${payload.ldr}` });
+  } else if (payload.ldr < 500 && payload.ldr > 0) {
+    alerts.push({ type: 'INFO', sensor: 'ldr', message: `DARK ENVIRONMENT DETECTED: LDR value ${payload.ldr}` });
+  }
+
+  // 3. ตรวจสอบกระแสไฟฟ้า (Current Alert)
+  if (payload.current > 2.5) {
+    alerts.push({ type: 'CRITICAL', sensor: 'current', message: `OVERCURRENT ALERT: ${payload.current.toFixed(2)}mA (Threshold > 2.5mA)` });
+  }
+
+  return alerts;
+}
 
 // --- WiFi Telemetry Endpoint (ESP32 HTTP POST Target) ---
 let lastSavedTimes = {};
@@ -99,7 +135,19 @@ app.post('/api/sensor', async (req, res) => {
     // 1. กระจายข้อมูลสดเข้า Frontend ทันที
     io.emit('dashboard_update', payload);
 
-    // 2. ตรวจสอบการบันทึกลง Database แยกราย User ตาม Setting
+    // 2. ตรวจสอบและ Broadcast Alert (ถ้ามีเข้าเงื่อนไข)
+    const alerts = checkSensorAlerts(payload);
+    if (alerts.length > 0) {
+      alerts.forEach(alert => {
+        console.log(`🚨 [ALERT] [${alert.type}] ${alert.message}`);
+        io.emit('sensor_alert', {
+          ...alert,
+          timestamp: new Date()
+        });
+      });
+    }
+
+    // 3. ตรวจสอบการบันทึกลง Database แยกราย User ตาม Setting
     let activeSettings = await Settings.find();
     if (!activeSettings.some(s => s.userId === 'unknow')) {
       const defaultUnknowSetting = await Settings.create({ userId: 'unknow', saveInterval: 'realtime' });
@@ -135,7 +183,7 @@ app.post('/api/sensor', async (req, res) => {
       }
     }
 
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', alertsTriggered: alerts.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -149,7 +197,7 @@ app.get('/api/download-csv', async (req, res) => {
 
   if (token) {
     try {
-      const decoded = jwt.verify(token, JWT_SECRET);
+      const decoded = jwt.verify(token, ACTIVE_JWT_SECRET);
       currentUserId = decoded.userId;
       currentUsername = decoded.username || 'Unknow';
     } catch (err) {}
