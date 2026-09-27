@@ -1,15 +1,7 @@
-// Setup support UI 4-13
 // ============================================================================
-// File: Dashboard_Template/frontend/src/App.jsx
-// วัตถุประสงค์ของการแก้ไขส่วนหัวและการเพิ่มโค้ดในไฟล์นี้:
-// 1. นำเข้าไลบรารี WebSocket / Socket.IO และ Chart.js เพื่อแสดงผลกราฟแบบ Real-time
-// 2. ตั้งค่าการดักจับ Event รับข้อมูล Realtime Payload จาก Backend
-// 3. อัปเดตข้อมูล State ของ React สำหรับ Gauges, Indicators (ไฟ LED) และ Line Charts
-// 4. จัด Layout ให้ตรงกับโครงสร้าง Dashboard และรองรับทั้ง Light / Dark Mode
-// 5. ตรวจสอบสถานะ Socket Connection จริง (Real-time Status)
-// 6. [แก้ไข] ปรับสไตล์แถบแสดงค่าด้านล่างเกจทั้ง 3 ช่องให้อ่านง่าย คมชัด บน Dark Theme
+// File: frontend/src/App.jsx
+// IoT Dashboard Frontend (React + Socket.IO + Chart.js + Tailwind CSS)
 // ============================================================================
-// File: Dashboard_Template/frontend/src/App.jsx
 import React, { useState, useEffect } from 'react';
 import io from 'socket.io-client';
 import { Line } from 'react-chartjs-2';
@@ -26,7 +18,15 @@ import {
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend);
 
-const socket = io('http://localhost:5000');
+// --- Backend Base URL Configuration ---
+// กำหนด URL ของ Render Backend
+const BACKEND_URL = 'https://iotdashboard-mq5d.onrender.com';
+
+// เชื่อมต่อ Socket.IO ไปยัง Server บน Render
+const socket = io(BACKEND_URL, {
+  transports: ['websocket', 'polling'],
+  autoConnect: true
+});
 
 // ================= ANALOG NEEDLE GAUGE COMPONENT =================
 function AnalogGauge({ value, min = 0, max = 100, unit = '', color = '#3b82f6', darkMode }) {
@@ -119,6 +119,7 @@ export default function App() {
   const [digitalHistory, setDigitalHistory] = useState([]);
   const [bandwidth, setBandwidth] = useState(0);
 
+  // ตรวจสอบ Token เมื่อเริ่มต้นเข้าเว็บ (Auto-login)
   useEffect(() => {
     const savedUser = localStorage.getItem('user');
     const savedToken = localStorage.getItem('token');
@@ -126,7 +127,7 @@ export default function App() {
     if (savedUser && savedToken) {
       setUser(JSON.parse(savedUser));
     } else if (savedToken) {
-      fetch('http://localhost:5000/api/me', {
+      fetch(`${BACKEND_URL}/api/me`, {
         headers: { Authorization: `Bearer ${savedToken}` }
       })
         .then(res => res.json())
@@ -147,11 +148,11 @@ export default function App() {
     }
   }, []);
 
-  // [ส่วนแก้ไข] Sync ค่า Setting ไปยัง Backend เมื่อเริ่มต้นโหลดแอป หรือล็อกอินสำเร็จ
+  // Sync ค่า Setting ไปยัง Backend เมื่อเริ่มต้นโหลดแอป หรือเปลี่ยนสถานะผู้ใช้
   useEffect(() => {
     const syncInitialSettings = async () => {
       try {
-        await fetch('http://localhost:5000/api/settings', {
+        await fetch(`${BACKEND_URL}/api/settings`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -167,6 +168,7 @@ export default function App() {
     syncInitialSettings();
   }, [user]);
 
+  // ดักจับ Socket Events จาก Backend
   useEffect(() => {
     const onConnect = () => setIsConnected(true);
     const onDisconnect = () => setIsConnected(false);
@@ -203,10 +205,11 @@ export default function App() {
     };
   }, []);
 
+  // ฟังก์ชัน Login / Register
   const handleAuth = async () => {
     const endpoint = isRegister ? '/api/register' : '/api/login';
     try {
-      const res = await fetch(`http://localhost:5000${endpoint}`, {
+      const res = await fetch(`${BACKEND_URL}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: usernameInput, password: passwordInput })
@@ -235,17 +238,19 @@ export default function App() {
     localStorage.removeItem('user');
   };
 
+  // ดาวน์โหลดไฟล์ CSV
   const handleDownloadCSV = () => {
     const token = localStorage.getItem('token') || '';
-    window.open(`http://localhost:5000/api/download-csv?token=${token}`, '_blank');
+    window.open(`${BACKEND_URL}/api/download-csv?token=${token}`, '_blank');
   };
 
+  // เปลี่ยนช่วงเวลาการบันทึกข้อมูล
   const handleSaveIntervalChange = async (e) => {
     const newInterval = e.target.value;
     setSaveInterval(newInterval);
 
     try {
-      await fetch('http://localhost:5000/api/settings', {
+      await fetch(`${BACKEND_URL}/api/settings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -258,11 +263,12 @@ export default function App() {
     }
   };
 
+  // ล้างข้อมูลใน Database
   const handleClearData = async () => {
     if (!window.confirm('คุณต้องการลบข้อมูลที่บันทึกไว้ในระบบทั้งหมดใช่หรือไม่?')) return;
 
     try {
-      const res = await fetch('http://localhost:5000/api/clear-data', {
+      const res = await fetch(`${BACKEND_URL}/api/clear-data`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -342,7 +348,7 @@ export default function App() {
                 onChange={e => setPasswordInput(e.target.value)} 
                 className="p-1 border rounded text-sm text-black w-20"
               />
-              <button onClick={handleAuth} className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-sm font-medium">
+              <button onClick={handleAuth} className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded-sm font-medium">
                 {isRegister ? 'Reg' : 'Login'}
               </button>
               <button onClick={() => setIsRegister(!isRegister)} className="text-xs text-blue-500 underline">
