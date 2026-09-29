@@ -1,7 +1,7 @@
 // ============================================================================
 // File: frontend/src/App.jsx
 // IoT Dashboard Frontend (React + Socket.IO + Chart.js + Tailwind CSS)
-// Invert LDR result Dark with resistance low value, Bright with resistance  high value (Inverted Signal)
+// Adding : Alert signal loss from hardware.
 // ============================================================================
 import React, { useState, useEffect, useRef } from 'react';
 import io from 'socket.io-client';
@@ -26,7 +26,7 @@ const socket = io(SOCKET_URL);
 // ค่ามาตรฐานความปลอดภัยต่อสายตา (Safety Thresholds)
 const DARK_THRESHOLD = 100;      // ค่าที่ต่ำกว่านี้ถือว่ามืด -> ปรับกราฟเป็น 0
 const SAFE_LIGHT_MAX = 800;      // ค่าสูงสุดที่ปลอดภัยต่อสายตา -> เกินนี้จะแจ้งเตือน
-const MAX_LDR_RAW = 1024;        // ค่า Maximum Raw จาก LDR (หากเป็น ADC 10-bit ให้ใช้ 1024 / หาก 12-bit ESP32 ให้เปลี่ยนเป็น 4095)
+const MAX_LDR_RAW = 1024;        // ค่า Maximum Raw จาก LDR (หากเป็น ESP32 ให้เปลี่ยนเป็น 4095)
 
 // ================= ANALOG NEEDLE GAUGE COMPONENT =================
 function AnalogGauge({ value, min = 0, max = 100, unit = '', color = '#3b82f6', darkMode }) {
@@ -95,10 +95,16 @@ export default function App() {
   const [saveInterval, setSaveInterval] = useState('realtime');
   const [isConnected, setIsConnected] = useState(socket.connected);
   
-  // สถานะแจ้งเตือนและการเปิด/ปิด Popup
+  // สถานะการแจ้งเตือนและ Popup Dropdown
   const [alerts, setAlerts] = useState([]);
   const [showAlertMenu, setShowAlertMenu] = useState(false);
   const alertMenuRef = useRef(null);
+
+  // สถานะการตรวจจับสัญญาณ Controller ขาดหาย (Signal Alert Tab)
+  const [signalLost, setSignalLost] = useState(false);
+  const [signalLostReason, setSignalLostReason] = useState('');
+  const [dismissSignalAlert, setDismissSignalAlert] = useState(false); // ควบคุมการกดปิดไอคอน [X]
+  const lastDataTimeRef = useRef(Date.now());
 
   // สถานะค่าเซนเซอร์ปัจจุบัน
   const [sensor, setSensor] = useState({
@@ -131,6 +137,26 @@ export default function App() {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  // ระบบตรวจจับสัญญาณขาดหาย (Signal Loss Detector)
+  useEffect(() => {
+    const checkSignalInterval = setInterval(() => {
+      const timeSinceLastData = Date.now() - lastDataTimeRef.current;
+
+      if (!isConnected) {
+        setSignalLost(true);
+        setSignalLostReason('Server Disconnected: การเชื่อมต่อกับ Server/Backend ขาดหาย');
+      } else if (timeSinceLastData > 3000) { // หากไม่มีข้อมูลส่งเข้ามาเกิน 3 วินาที
+        setSignalLost(true);
+        setSignalLostReason('Controller Offline: บอร์ด Controller ไม่ได้ส่งข้อมูล (เช็กไฟเลี้ยงบอร์ด หรือสัญญาณ Wi-Fi)');
+      } else {
+        setSignalLost(false);
+        setDismissSignalAlert(false); // รีเซ็ตสถานะเมื่อสัญญาณกลับมาปกติ
+      }
+    }, 1000);
+
+    return () => clearInterval(checkSignalInterval);
+  }, [isConnected]);
+
   // การรับฟังข้อมูล realtime ผ่าน Socket.IO
   useEffect(() => {
     const onConnect = () => setIsConnected(true);
@@ -141,22 +167,22 @@ export default function App() {
 
     // รับข้อมูลอัปเดตจากเซนเซอร์
     socket.on('dashboard_update', (data) => {
+      // อัปเดตเวลาล่าสุดที่ได้รับข้อมูลจาก Controller
+      lastDataTimeRef.current = Date.now();
+
       // 1. จำกัดค่า Resistance ไม่ให้เกิน 10,000 Ohm (10k)
       const rawResistance = data.resistance || 0;
       const clampedResistance = Math.min(Math.max(rawResistance, 0), 10000);
 
-      // 2. กลับค่า LDR (Invert LDR Signal) เนื่องจากฮาร์ดแวร์อ่านค่าได้ตรงข้าม
+      // 2. กลับค่า LDR (Invert LDR Signal)
       const rawLdr = data.ldr || 0;
-      // Invert: ยิ่งมืด ค่าจริงที่วัดได้จากวงจรจะสูง เราเอา MAX - rawLdr เพื่อให้มืดกลายเป็นค่าต่ำ
       const invertedLdr = Math.max(0, MAX_LDR_RAW - rawLdr);
 
       let chartLdr = invertedLdr;
 
       if (invertedLdr <= DARK_THRESHOLD) {
-        // เมื่อมืด -> กราฟตกเป็น 0
         chartLdr = 0;
       } else if (invertedLdr > SAFE_LIGHT_MAX) {
-        // เมื่อสว่างเกินมาตรฐานสายตา -> เพิ่ม Alert และบีบค่าไม่ให้เกินขีดปลอดภัย
         chartLdr = SAFE_LIGHT_MAX;
         
         const alertMsg = `⚠️ BRIGHT LIGHT WARNING: LDR value (${invertedLdr}) exceeds safe threshold (${SAFE_LIGHT_MAX})`;
@@ -176,7 +202,7 @@ export default function App() {
       const timeStr = new Date().toLocaleTimeString();
       setBandwidth(JSON.stringify(data).length);
 
-      // บันทึกประวัติสำหรับกราฟเส้น (ใช้ chartLdr ที่ปรับแต่งเฟสแล้ว)
+      // บันทึกประวัติสำหรับกราฟเส้น
       setAnalogHistory(prev => [
         ...prev.slice(-19),
         { 
@@ -200,7 +226,6 @@ export default function App() {
       ]);
     });
 
-    // รับการแจ้งเตือนเพิ่มเติมจาก Backend Socket
     socket.on('sensor_alert', (alertData) => {
       setAlerts(prev => [alertData, ...prev.slice(0, 19)]);
     });
@@ -213,13 +238,11 @@ export default function App() {
     };
   }, []);
 
-  // ฟังก์ชันล้างค่าการแจ้งเตือน (Clear Alerts)
   const handleClearAlerts = () => {
     setAlerts([]);
     setShowAlertMenu(false);
   };
 
-  // ระบบเข้าสู่ระบบ / ลงทะเบียน
   const handleAuth = async () => {
     const endpoint = isRegister ? '/api/register' : '/api/login';
     try {
@@ -408,6 +431,27 @@ export default function App() {
         </div>
       </div>
 
+      {/* SIGNAL ALERT TAB (แสดงผลเมื่อขาดสัญญาณจาก Controller / Server) */}
+      {signalLost && !dismissSignalAlert && (
+        <div className="mb-4 p-3 bg-red-600/90 text-white rounded-lg shadow-lg flex items-center justify-between animate-pulse border border-red-500">
+          <div className="flex items-center gap-2">
+            <span className="text-xl">📡</span>
+            <div>
+              <span className="font-bold text-sm">SIGNAL ALERT: </span>
+              <span className="text-xs sm:text-sm font-medium">{signalLostReason}</span>
+            </div>
+          </div>
+          {/* ปุ่มไอคอนปิด [✕] ทางขวามือ */}
+          <button
+            onClick={() => setDismissSignalAlert(true)}
+            className="p-1 text-white/80 hover:text-white hover:bg-red-700/60 rounded-md transition-colors text-lg font-bold leading-none px-2.5 ml-2"
+            title="Dismiss Alert"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* ROW 1: GAUGES & LED STATUS */}
       <div className="grid grid-cols-12 gap-4 mb-4">
         <div className={`col-span-12 md:col-span-4 p-4 rounded-lg shadow-md flex flex-col items-center ${darkMode ? 'bg-gray-800' : 'bg-white'}`}>
@@ -490,7 +534,11 @@ export default function App() {
           <tbody className="text-sm">
             <tr>
               <td className="p-3 font-bold">
-                {isConnected ? <span className="text-green-500">🟢 Connected</span> : <span className="text-red-500">🔴 Disconnected</span>}
+                {isConnected && !signalLost ? (
+                  <span className="text-green-500">🟢 Connected</span>
+                ) : (
+                  <span className="text-red-500">🔴 Signal Lost</span>
+                )}
               </td>
               <td className="p-3">{bandwidth} Bytes / pkt</td>
               <td className="p-3 font-medium">{user ? user.username : 'Guest (Unknow)'}</td>
