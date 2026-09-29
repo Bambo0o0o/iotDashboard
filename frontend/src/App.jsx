@@ -1,6 +1,7 @@
 // ============================================================================
 // File: frontend/src/App.jsx
 // IoT Dashboard Frontend (React + Socket.IO + Chart.js + Tailwind CSS)
+// Invert LDR result Dark with resistance low value, Bright with resistance  high value (Inverted Signal)
 // ============================================================================
 import React, { useState, useEffect, useRef } from 'react';
 import io from 'socket.io-client';
@@ -25,6 +26,7 @@ const socket = io(SOCKET_URL);
 // ค่ามาตรฐานความปลอดภัยต่อสายตา (Safety Thresholds)
 const DARK_THRESHOLD = 100;      // ค่าที่ต่ำกว่านี้ถือว่ามืด -> ปรับกราฟเป็น 0
 const SAFE_LIGHT_MAX = 800;      // ค่าสูงสุดที่ปลอดภัยต่อสายตา -> เกินนี้จะแจ้งเตือน
+const MAX_LDR_RAW = 1024;        // ค่า Maximum Raw จาก LDR (หากเป็น ADC 10-bit ให้ใช้ 1024 / หาก 12-bit ESP32 ให้เปลี่ยนเป็น 4095)
 
 // ================= ANALOG NEEDLE GAUGE COMPONENT =================
 function AnalogGauge({ value, min = 0, max = 100, unit = '', color = '#3b82f6', darkMode }) {
@@ -143,19 +145,21 @@ export default function App() {
       const rawResistance = data.resistance || 0;
       const clampedResistance = Math.min(Math.max(rawResistance, 0), 10000);
 
-      // 2. ปรับการคำนวณค่า LDR ตามเงื่อนไขความสว่าง
+      // 2. กลับค่า LDR (Invert LDR Signal) เนื่องจากฮาร์ดแวร์อ่านค่าได้ตรงข้าม
       const rawLdr = data.ldr || 0;
-      let chartLdr = rawLdr;
+      // Invert: ยิ่งมืด ค่าจริงที่วัดได้จากวงจรจะสูง เราเอา MAX - rawLdr เพื่อให้มืดกลายเป็นค่าต่ำ
+      const invertedLdr = Math.max(0, MAX_LDR_RAW - rawLdr);
 
-      if (rawLdr <= DARK_THRESHOLD) {
+      let chartLdr = invertedLdr;
+
+      if (invertedLdr <= DARK_THRESHOLD) {
         // เมื่อมืด -> กราฟตกเป็น 0
         chartLdr = 0;
-      } else if (rawLdr > SAFE_LIGHT_MAX) {
-        // เมื่อสว่างเกินมาตรฐานสายตา -> เพิ่ม Alert และบีบค่าไม่ให้สว่างเกินปลอดภัย
+      } else if (invertedLdr > SAFE_LIGHT_MAX) {
+        // เมื่อสว่างเกินมาตรฐานสายตา -> เพิ่ม Alert และบีบค่าไม่ให้เกินขีดปลอดภัย
         chartLdr = SAFE_LIGHT_MAX;
         
-        // สร้างการแจ้งเตือนสว่างเกินไป (ป้องกันการสร้างซ้ำรวดเร็วเกินไป)
-        const alertMsg = `⚠️ BRIGHT LIGHT WARNING: LDR value (${rawLdr}) exceeds safe threshold (${SAFE_LIGHT_MAX})`;
+        const alertMsg = `⚠️ BRIGHT LIGHT WARNING: LDR value (${invertedLdr}) exceeds safe threshold (${SAFE_LIGHT_MAX})`;
         setAlerts(prev => {
           if (prev.length > 0 && prev[0].message === alertMsg) return prev;
           return [{ type: 'WARNING', message: alertMsg, timestamp: new Date() }, ...prev.slice(0, 19)];
@@ -165,14 +169,14 @@ export default function App() {
       const updatedSensorData = {
         ...data,
         resistance: clampedResistance,
-        ldr: rawLdr
+        ldr: invertedLdr
       };
 
       setSensor(updatedSensorData);
       const timeStr = new Date().toLocaleTimeString();
       setBandwidth(JSON.stringify(data).length);
 
-      // บันทึกประวัติสำหรับกราฟเส้น (ใช้ chartLdr ที่ปรับแต่งค่าแล้ว)
+      // บันทึกประวัติสำหรับกราฟเส้น (ใช้ chartLdr ที่ปรับแต่งเฟสแล้ว)
       setAnalogHistory(prev => [
         ...prev.slice(-19),
         { 
