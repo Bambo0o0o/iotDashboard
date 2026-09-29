@@ -1,7 +1,7 @@
 // ============================================================================
 // File: frontend/src/App.jsx
-// IoT Dashboard Frontend (React + Socket.IO + Chart.js + Tailwind CSS)
-// Adding : Alert signal loss from hardware.
+// IoT Dashboard Frontend (React + Socket.IO + Chart.js + Dynamic Timeout Watchdog)
+// Update : Dynamic sending data to backend with user-defined interval (Realtime, 10s, 5m, 1h)
 // ============================================================================
 import React, { useState, useEffect, useRef } from 'react';
 import io from 'socket.io-client';
@@ -19,14 +19,12 @@ import {
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend);
 
-// กำหนด URL ของ Backend Service
 const SOCKET_URL = process.env.REACT_APP_BACKEND_URL || 'https://iotdashboard-mq5d.onrender.com';
 const socket = io(SOCKET_URL);
 
-// ค่ามาตรฐานความปลอดภัยต่อสายตา (Safety Thresholds)
-const DARK_THRESHOLD = 100;      // ค่าที่ต่ำกว่านี้ถือว่ามืด -> ปรับกราฟเป็น 0
-const SAFE_LIGHT_MAX = 800;      // ค่าสูงสุดที่ปลอดภัยต่อสายตา -> เกินนี้จะแจ้งเตือน
-const MAX_LDR_RAW = 1024;        // ค่า Maximum Raw จาก LDR (หากเป็น ESP32 ให้เปลี่ยนเป็น 4095)
+const DARK_THRESHOLD = 100;
+const SAFE_LIGHT_MAX = 800;
+const MAX_LDR_RAW = 1024;
 
 // ================= ANALOG NEEDLE GAUGE COMPONENT =================
 function AnalogGauge({ value, min = 0, max = 100, unit = '', color = '#3b82f6', darkMode }) {
@@ -41,7 +39,6 @@ function AnalogGauge({ value, min = 0, max = 100, unit = '', color = '#3b82f6', 
   return (
     <div className="flex flex-col items-center justify-center w-full">
       <svg viewBox="0 0 200 120" className="w-48 h-28 overflow-visible">
-        {/* เส้นโค้งพื้นหลัง */}
         <path
           d="M 20 100 A 80 80 0 0 1 180 100"
           fill="none"
@@ -49,7 +46,6 @@ function AnalogGauge({ value, min = 0, max = 100, unit = '', color = '#3b82f6', 
           strokeWidth="16"
           strokeLinecap="round"
         />
-        {/* เส้นโค้งระดับตามค่าข้อมูล */}
         <path
           d="M 20 100 A 80 80 0 0 1 180 100"
           fill="none"
@@ -60,7 +56,6 @@ function AnalogGauge({ value, min = 0, max = 100, unit = '', color = '#3b82f6', 
           strokeDashoffset={251.2 * (1 - percentage)}
           className="transition-all duration-300 ease-out"
         />
-        {/* เข็มชี้วัด */}
         <line
           x1="100"
           y1="100"
@@ -95,69 +90,70 @@ export default function App() {
   const [saveInterval, setSaveInterval] = useState('realtime');
   const [isConnected, setIsConnected] = useState(socket.connected);
   
-  // สถานะการแจ้งเตือนและ Popup Dropdown
   const [alerts, setAlerts] = useState([]);
   const [showAlertMenu, setShowAlertMenu] = useState(false);
   const alertMenuRef = useRef(null);
 
-  // สถานะการตรวจจับสัญญาณ Controller ขาดหาย (Signal Alert Tab)
   const [signalLost, setSignalLost] = useState(false);
   const [signalLostReason, setSignalLostReason] = useState('');
-  const [dismissSignalAlert, setDismissSignalAlert] = useState(false); // ควบคุมการกดปิดไอคอน [X]
+  const [dismissSignalAlert, setDismissSignalAlert] = useState(false);
   const lastDataTimeRef = useRef(Date.now());
 
-  // สถานะค่าเซนเซอร์ปัจจุบัน
   const [sensor, setSensor] = useState({
     voltage: 0, resistance: 0, current: 0, ldr: 0,
     btn1Raw: 0, btn1Debounced: 0, btn2Raw: 0, btn2Debounced: 0
   });
 
-  // ประวัติสำหรับกราฟเส้น
   const [analogHistory, setAnalogHistory] = useState([]);
   const [digitalHistory, setDigitalHistory] = useState([]);
   const [bandwidth, setBandwidth] = useState(0);
 
-  // ตรวจสอบ Token เมื่อเริ่มต้นหน้า
+  // คำนวณ Timeout ตามค่า Interval ที่เลือก
+  const getTimeoutByInterval = (interval) => {
+    switch (interval) {
+      case '10s': return 10 * 1000 + 3000;
+      case '5m':  return 5 * 60 * 1000 + 10000;
+      case '1h':  return 60 * 60 * 1000 + 30000;
+      case 'realtime':
+      default:    return 4000;
+    }
+  };
+
   useEffect(() => {
     const savedUser = localStorage.getItem('user');
     const savedToken = localStorage.getItem('token');
-    if (savedUser && savedToken) {
-      setUser(JSON.parse(savedUser));
-    }
+    if (savedUser && savedToken) setUser(JSON.parse(savedUser));
   }, []);
 
-  // ปิด Popup แจ้งเตือนเมื่อคลิกพื้นที่อื่นภายนอก
   useEffect(() => {
     const handleClickOutside = (event) => {
-      if (alertMenuRef.current && !alertMenuRef.current.contains(event.target)) {
-        setShowAlertMenu(false);
-      }
+      if (alertMenuRef.current && !alertMenuRef.current.contains(event.target)) setShowAlertMenu(false);
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  // ระบบตรวจจับสัญญาณขาดหาย (Signal Loss Detector)
+  // ตรวจจับสัญญาณขาดหายแบบ Dynamic Timeout
   useEffect(() => {
     const checkSignalInterval = setInterval(() => {
       const timeSinceLastData = Date.now() - lastDataTimeRef.current;
+      const allowedTimeout = getTimeoutByInterval(saveInterval);
 
       if (!isConnected) {
         setSignalLost(true);
         setSignalLostReason('Server Disconnected: การเชื่อมต่อกับ Server/Backend ขาดหาย');
-      } else if (timeSinceLastData > 3000) { // หากไม่มีข้อมูลส่งเข้ามาเกิน 3 วินาที
+      } else if (timeSinceLastData > allowedTimeout) {
         setSignalLost(true);
-        setSignalLostReason('Controller Offline: บอร์ด Controller ไม่ได้ส่งข้อมูล (เช็กไฟเลี้ยงบอร์ด หรือสัญญาณ Wi-Fi)');
+        setSignalLostReason(`Controller Timeout: บอร์ดController ไม่ส่งข้อมูลเกินกำหนด (${saveInterval})`);
       } else {
         setSignalLost(false);
-        setDismissSignalAlert(false); // รีเซ็ตสถานะเมื่อสัญญาณกลับมาปกติ
+        setDismissSignalAlert(false);
       }
     }, 1000);
 
     return () => clearInterval(checkSignalInterval);
-  }, [isConnected]);
+  }, [isConnected, saveInterval]);
 
-  // การรับฟังข้อมูล realtime ผ่าน Socket.IO
   useEffect(() => {
     const onConnect = () => setIsConnected(true);
     const onDisconnect = () => setIsConnected(false);
@@ -165,26 +161,20 @@ export default function App() {
     socket.on('connect', onConnect);
     socket.on('disconnect', onDisconnect);
 
-    // รับข้อมูลอัปเดตจากเซนเซอร์
     socket.on('dashboard_update', (data) => {
-      // อัปเดตเวลาล่าสุดที่ได้รับข้อมูลจาก Controller
       lastDataTimeRef.current = Date.now();
+      setSignalLost(false);
 
-      // 1. จำกัดค่า Resistance ไม่ให้เกิน 10,000 Ohm (10k)
       const rawResistance = data.resistance || 0;
       const clampedResistance = Math.min(Math.max(rawResistance, 0), 10000);
 
-      // 2. กลับค่า LDR (Invert LDR Signal)
       const rawLdr = data.ldr || 0;
       const invertedLdr = Math.max(0, MAX_LDR_RAW - rawLdr);
 
       let chartLdr = invertedLdr;
-
-      if (invertedLdr <= DARK_THRESHOLD) {
-        chartLdr = 0;
-      } else if (invertedLdr > SAFE_LIGHT_MAX) {
+      if (invertedLdr <= DARK_THRESHOLD) chartLdr = 0;
+      else if (invertedLdr > SAFE_LIGHT_MAX) {
         chartLdr = SAFE_LIGHT_MAX;
-        
         const alertMsg = `⚠️ BRIGHT LIGHT WARNING: LDR value (${invertedLdr}) exceeds safe threshold (${SAFE_LIGHT_MAX})`;
         setAlerts(prev => {
           if (prev.length > 0 && prev[0].message === alertMsg) return prev;
@@ -192,38 +182,33 @@ export default function App() {
         });
       }
 
-      const updatedSensorData = {
-        ...data,
-        resistance: clampedResistance,
-        ldr: invertedLdr
-      };
-
-      setSensor(updatedSensorData);
+      setSensor({ ...data, resistance: clampedResistance, ldr: invertedLdr });
       const timeStr = new Date().toLocaleTimeString();
       setBandwidth(JSON.stringify(data).length);
 
-      // บันทึกประวัติสำหรับกราฟเส้น
       setAnalogHistory(prev => [
         ...prev.slice(-19),
-        { 
-          time: timeStr, 
-          ldr: chartLdr, 
-          v: data.voltage || 0, 
-          r: clampedResistance, 
-          i: data.current || 0 
-        }
+        { time: timeStr, ldr: chartLdr, v: data.voltage || 0, r: clampedResistance, i: data.current || 0 }
       ]);
 
       setDigitalHistory(prev => [
         ...prev.slice(-19),
-        { 
-          time: timeStr, 
-          b1Raw: data.btn1Raw || 0, 
-          b1Clean: data.btn1Debounced || 0, 
-          b2Raw: data.btn2Raw || 0, 
-          b2Clean: data.btn2Debounced || 0 
-        }
+        { time: timeStr, b1Raw: data.btn1Raw || 0, b1Clean: data.btn1Debounced || 0, b2Raw: data.btn2Raw || 0, b2Clean: data.btn2Debounced || 0 }
       ]);
+    });
+
+    socket.on('controller_status', (status) => {
+      if (!status.online) {
+        setSignalLost(true);
+        setSignalLostReason(status.reason);
+      }
+    });
+
+    socket.on('interval_changed', (data) => {
+      if (data.saveInterval) {
+        setSaveInterval(data.saveInterval);
+        lastDataTimeRef.current = Date.now();
+      }
     });
 
     socket.on('sensor_alert', (alertData) => {
@@ -234,6 +219,8 @@ export default function App() {
       socket.off('connect', onConnect);
       socket.off('disconnect', onDisconnect);
       socket.off('dashboard_update');
+      socket.off('controller_status');
+      socket.off('interval_changed');
       socket.off('sensor_alert');
     };
   }, []);
@@ -283,6 +270,7 @@ export default function App() {
   const handleSaveIntervalChange = async (e) => {
     const newInterval = e.target.value;
     setSaveInterval(newInterval);
+    lastDataTimeRef.current = Date.now();
 
     try {
       await fetch(`${SOCKET_URL}/api/settings`, {
@@ -307,14 +295,12 @@ export default function App() {
         
         <div className="flex items-center gap-3">
           
-          {/* BELL ICON & ALERT POPUP DROPDOWN */}
+          {/* BELL ICON & ALERT DROPDOWN */}
           <div className="relative" ref={alertMenuRef}>
             <button
               onClick={() => setShowAlertMenu(!showAlertMenu)}
               className={`p-2 rounded-lg border relative transition-colors ${
-                darkMode 
-                  ? 'border-gray-600 hover:bg-gray-700 bg-gray-800' 
-                  : 'border-gray-300 hover:bg-gray-100 bg-white'
+                darkMode ? 'border-gray-600 hover:bg-gray-700 bg-gray-800' : 'border-gray-300 hover:bg-gray-100 bg-white'
               }`}
               title="System Notifications"
             >
@@ -326,7 +312,6 @@ export default function App() {
               )}
             </button>
 
-            {/* POPUP MENU */}
             {showAlertMenu && (
               <div className={`absolute right-0 mt-2 w-80 sm:w-96 rounded-xl shadow-2xl border z-50 overflow-hidden ${
                 darkMode ? 'bg-gray-800 border-gray-700 text-white' : 'bg-white border-gray-200 text-gray-900'
@@ -352,28 +337,18 @@ export default function App() {
 
                 <div className="max-h-80 overflow-y-auto divide-y divide-gray-700/50">
                   {alerts.length === 0 ? (
-                    <div className="p-6 text-center text-sm text-gray-400">
-                      🔔 No new notifications
-                    </div>
+                    <div className="p-6 text-center text-sm text-gray-400">🔔 No new notifications</div>
                   ) : (
                     alerts.map((al, idx) => (
                       <div
                         key={idx}
                         className={`p-3 text-xs flex justify-between items-start gap-2 transition-colors ${
-                          al.type === 'CRITICAL'
-                            ? 'bg-red-500/10 hover:bg-red-500/20'
-                            : al.type === 'WARNING'
-                            ? 'bg-amber-500/10 hover:bg-amber-500/20'
-                            : 'bg-blue-500/10 hover:bg-blue-500/20'
+                          al.type === 'CRITICAL' ? 'bg-red-500/10 hover:bg-red-500/20' : al.type === 'WARNING' ? 'bg-amber-500/10 hover:bg-amber-500/20' : 'bg-blue-500/10 hover:bg-blue-500/20'
                         }`}
                       >
                         <div className="flex-1">
                           <span className={`inline-block font-bold px-1.5 py-0.5 rounded text-[10px] mr-1.5 mb-1 ${
-                            al.type === 'CRITICAL'
-                              ? 'bg-red-600 text-white'
-                              : al.type === 'WARNING'
-                              ? 'bg-amber-500 text-black'
-                              : 'bg-blue-600 text-white'
+                            al.type === 'CRITICAL' ? 'bg-red-600 text-white' : al.type === 'WARNING' ? 'bg-amber-500 text-black' : 'bg-blue-600 text-white'
                           }`}>
                             {al.type || 'INFO'}
                           </span>
@@ -390,25 +365,15 @@ export default function App() {
             )}
           </div>
 
-          <button 
-            onClick={() => setDarkMode(!darkMode)} 
-            className="p-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm"
-          >
+          <button onClick={() => setDarkMode(!darkMode)} className="p-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm">
             {darkMode ? '☀️ Light' : '🌙 Dark'}
           </button>
 
-          <button 
-            onClick={handleDownloadCSV} 
-            className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium"
-          >
+          <button onClick={handleDownloadCSV} className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium">
             📥 Download CSV
           </button>
 
-          <select 
-            value={saveInterval} 
-            onChange={handleSaveIntervalChange} 
-            className="p-2 border border-gray-300 rounded-lg text-sm bg-white text-gray-800 font-medium"
-          >
+          <select value={saveInterval} onChange={handleSaveIntervalChange} className="p-2 border border-gray-300 rounded-lg text-sm bg-white text-gray-800 font-medium">
             <option value="realtime">Setting: Realtime</option>
             <option value="10s">Setting: 10s</option>
             <option value="5m">Setting: 5m</option>
@@ -431,7 +396,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* SIGNAL ALERT TAB (แสดงผลเมื่อขาดสัญญาณจาก Controller / Server) */}
+      {/* SIGNAL ALERT TAB */}
       {signalLost && !dismissSignalAlert && (
         <div className="mb-4 p-3 bg-red-600/90 text-white rounded-lg shadow-lg flex items-center justify-between animate-pulse border border-red-500">
           <div className="flex items-center gap-2">
@@ -441,7 +406,6 @@ export default function App() {
               <span className="text-xs sm:text-sm font-medium">{signalLostReason}</span>
             </div>
           </div>
-          {/* ปุ่มไอคอนปิด [✕] ทางขวามือ */}
           <button
             onClick={() => setDismissSignalAlert(true)}
             className="p-1 text-white/80 hover:text-white hover:bg-red-700/60 rounded-md transition-colors text-lg font-bold leading-none px-2.5 ml-2"

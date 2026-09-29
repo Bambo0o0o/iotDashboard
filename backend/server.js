@@ -1,6 +1,6 @@
 // ==========================================
 // File: backend/server.js
-// IoT Dashboard Backend Server (Express + Socket.IO + MongoDB + Alert System)
+// IoT Dashboard Backend Server (Express + Socket.IO + MongoDB + Alert System + Watchdog)
 // ==========================================
 require('dotenv').config();
 
@@ -65,6 +65,40 @@ const SensorDataSchema = new mongoose.Schema({
 });
 const SensorData = mongoose.model('SensorData', SensorDataSchema);
 
+// --- Watchdog Heartbeat Variables ---
+let currentInterval = 'realtime'; // 'realtime', '10s', '5m', '1h'
+let lastControllerDataTime = Date.now();
+let watchdogTimer = null;
+
+function getIntervalMs(intervalStr) {
+  switch (intervalStr) {
+    case '10s': return 10 * 1000;
+    case '5m':  return 5 * 60 * 1000;
+    case '1h':  return 60 * 60 * 1000;
+    case 'realtime':
+    default:    return 3 * 1000;
+  }
+}
+
+function startWatchdog() {
+  if (watchdogTimer) clearInterval(watchdogTimer);
+
+  watchdogTimer = setInterval(() => {
+    const timeoutMs = getIntervalMs(currentInterval) * 1.3; // เผื่อ Buffer 30%
+    const timeDiff = Date.now() - lastControllerDataTime;
+
+    if (timeDiff > timeoutMs) {
+      io.emit('sensor_alert', {
+        type: 'CRITICAL',
+        sensor: 'controller',
+        message: `Controller Timeout: ไม่ได้รับข้อมูลจาก Controller เกินกำหนด (${currentInterval})`,
+        timestamp: new Date()
+      });
+      io.emit('controller_status', { online: false, reason: `ไม่ได้รับข้อมูลตามช่วงเวลาที่กำหนด (${currentInterval})` });
+    }
+  }, 2000);
+}
+
 // --- Auth Routes ---
 app.post('/api/register', async (req, res) => {
   try {
@@ -101,27 +135,21 @@ app.get('/api/me', async (req, res) => {
 });
 
 // --- Helper Function: Alert Checking System ---
-/**
- * @brief ฟังก์ชันตรวจสอบค่าความผิดปกติของเซนเซอร์เพื่อส่งการแจ้งเตือน
- */
 function checkSensorAlerts(payload) {
   const alerts = [];
 
-  // 1. ตรวจสอบแรงดันไฟฟ้า (Voltage Alert)
   if (payload.voltage > 3.0) {
     alerts.push({ type: 'WARNING', sensor: 'voltage', message: `HIGH VOLTAGE DETECTED: ${payload.voltage.toFixed(2)}V (Threshold > 3.0V)` });
   } else if (payload.voltage < 0.5 && payload.voltage > 0) {
     alerts.push({ type: 'WARNING', sensor: 'voltage', message: `LOW VOLTAGE DETECTED: ${payload.voltage.toFixed(2)}V (Threshold < 0.5V)` });
   }
 
-  // 2. ตรวจสอบระดับแสง LDR (Light Alert)
   if (payload.ldr > 3500) {
     alerts.push({ type: 'INFO', sensor: 'ldr', message: `BRIGHT LIGHT DETECTED: LDR value ${payload.ldr}` });
   } else if (payload.ldr < 500 && payload.ldr > 0) {
     alerts.push({ type: 'INFO', sensor: 'ldr', message: `DARK ENVIRONMENT DETECTED: LDR value ${payload.ldr}` });
   }
 
-  // 3. ตรวจสอบกระแสไฟฟ้า (Current Alert)
   if (payload.current > 2.5) {
     alerts.push({ type: 'CRITICAL', sensor: 'current', message: `OVERCURRENT ALERT: ${payload.current.toFixed(2)}mA (Threshold > 2.5mA)` });
   }
@@ -129,29 +157,30 @@ function checkSensorAlerts(payload) {
   return alerts;
 }
 
-// --- WiFi Telemetry Endpoint (ESP32 HTTPS POST Target) ---
+// --- WiFi Telemetry Endpoint ---
 let lastSavedTimes = {};
 
 app.post('/api/sensor', async (req, res) => {
   try {
     const payload = req.body;
 
+    // อัปเดตเวลาล่าสุดเพื่อป้องกัน Watchdog Alert
+    lastControllerDataTime = Date.now();
+    io.emit('controller_status', { online: true });
+
     // 1. กระจายข้อมูลสดเข้า Frontend ทันทีผ่าน Socket.IO
     io.emit('dashboard_update', payload);
 
-    // 2. ตรวจสอบและ Broadcast Alert (ถ้ามีเงื่อนไขตรงตามที่กำหนด)
+    // 2. ตรวจสอบและ Broadcast Alert
     const alerts = checkSensorAlerts(payload);
     if (alerts.length > 0) {
       alerts.forEach(alert => {
         console.log(`🚨 [ALERT] [${alert.type}] ${alert.message}`);
-        io.emit('sensor_alert', {
-          ...alert,
-          timestamp: new Date()
-        });
+        io.emit('sensor_alert', { ...alert, timestamp: new Date() });
       });
     }
 
-    // 3. ตรวจสอบการบันทึกลง Database แยกราย User ตาม Setting (Save Interval)
+    // 3. ตรวจสอบการบันทึกลง Database
     let activeSettings = await Settings.find();
     if (!activeSettings.some(s => s.userId === 'unknow')) {
       const defaultUnknowSetting = await Settings.create({ userId: 'unknow', saveInterval: 'realtime' });
@@ -179,11 +208,7 @@ app.post('/api/sensor', async (req, res) => {
           } catch (e) {}
         }
 
-        await SensorData.create({
-          userId: uId,
-          username: username,
-          ...payload
-        });
+        await SensorData.create({ userId: uId, username: username, ...payload });
       }
     }
 
@@ -245,7 +270,12 @@ app.post('/api/settings', async (req, res) => {
       { upsert: true, new: true }
     );
 
+    currentInterval = saveInterval;
+    lastControllerDataTime = Date.now();
+    startWatchdog();
+
     io.emit('setting_updated', { userId: targetUser, saveInterval });
+    io.emit('interval_changed', { saveInterval });
     res.json({ success: true, message: `Setting updated to ${saveInterval}` });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -261,7 +291,10 @@ app.delete('/api/clear-data', async (req, res) => {
 
 io.on('connection', (socket) => {
   console.log('⚡ Client Connected:', socket.id);
+  socket.emit('interval_changed', { saveInterval: currentInterval });
 });
+
+startWatchdog();
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
