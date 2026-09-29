@@ -2,7 +2,7 @@
 // File: frontend/src/App.jsx
 // IoT Dashboard Frontend (React + Socket.IO + Chart.js + Tailwind CSS)
 // ============================================================================
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import io from 'socket.io-client';
 import { Line } from 'react-chartjs-2';
 import {
@@ -22,10 +22,11 @@ ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, T
 const SOCKET_URL = process.env.REACT_APP_BACKEND_URL || 'https://iotdashboard-mq5d.onrender.com';
 const socket = io(SOCKET_URL);
 
+// ค่ามาตรฐานความปลอดภัยต่อสายตา (Safety Thresholds)
+const DARK_THRESHOLD = 100;      // ค่าที่ต่ำกว่านี้ถือว่ามืด -> ปรับกราฟเป็น 0
+const SAFE_LIGHT_MAX = 800;      // ค่าสูงสุดที่ปลอดภัยต่อสายตา -> เกินนี้จะแจ้งเตือน
+
 // ================= ANALOG NEEDLE GAUGE COMPONENT =================
-/**
- * @brief คอมโพเนนต์เข็มไมล์จำลอง (Analog Gauge) สำหรับแสดงค่าแรงดันและความต้านทาน
- */
 function AnalogGauge({ value, min = 0, max = 100, unit = '', color = '#3b82f6', darkMode }) {
   const clampedValue = Math.min(Math.max(value, min), max);
   const percentage = (clampedValue - min) / (max - min);
@@ -91,7 +92,11 @@ export default function App() {
   const [passwordInput, setPasswordInput] = useState('');
   const [saveInterval, setSaveInterval] = useState('realtime');
   const [isConnected, setIsConnected] = useState(socket.connected);
+  
+  // สถานะแจ้งเตือนและการเปิด/ปิด Popup
   const [alerts, setAlerts] = useState([]);
+  const [showAlertMenu, setShowAlertMenu] = useState(false);
+  const alertMenuRef = useRef(null);
 
   // สถานะค่าเซนเซอร์ปัจจุบัน
   const [sensor, setSensor] = useState({
@@ -113,6 +118,17 @@ export default function App() {
     }
   }, []);
 
+  // ปิด Popup แจ้งเตือนเมื่อคลิกพื้นที่อื่นภายนอก
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (alertMenuRef.current && !alertMenuRef.current.contains(event.target)) {
+        setShowAlertMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
   // การรับฟังข้อมูล realtime ผ่าน Socket.IO
   useEffect(() => {
     const onConnect = () => setIsConnected(true);
@@ -123,24 +139,45 @@ export default function App() {
 
     // รับข้อมูลอัปเดตจากเซนเซอร์
     socket.on('dashboard_update', (data) => {
-      // 1. จำดัดค่า Resistance ไม่ให้เกิน 10,000 Ohm (10k)
+      // 1. จำกัดค่า Resistance ไม่ให้เกิน 10,000 Ohm (10k)
       const rawResistance = data.resistance || 0;
       const clampedResistance = Math.min(Math.max(rawResistance, 0), 10000);
 
+      // 2. ปรับการคำนวณค่า LDR ตามเงื่อนไขความสว่าง
+      const rawLdr = data.ldr || 0;
+      let chartLdr = rawLdr;
+
+      if (rawLdr <= DARK_THRESHOLD) {
+        // เมื่อมืด -> กราฟตกเป็น 0
+        chartLdr = 0;
+      } else if (rawLdr > SAFE_LIGHT_MAX) {
+        // เมื่อสว่างเกินมาตรฐานสายตา -> เพิ่ม Alert และบีบค่าไม่ให้สว่างเกินปลอดภัย
+        chartLdr = SAFE_LIGHT_MAX;
+        
+        // สร้างการแจ้งเตือนสว่างเกินไป (ป้องกันการสร้างซ้ำรวดเร็วเกินไป)
+        const alertMsg = `⚠️ BRIGHT LIGHT WARNING: LDR value (${rawLdr}) exceeds safe threshold (${SAFE_LIGHT_MAX})`;
+        setAlerts(prev => {
+          if (prev.length > 0 && prev[0].message === alertMsg) return prev;
+          return [{ type: 'WARNING', message: alertMsg, timestamp: new Date() }, ...prev.slice(0, 19)];
+        });
+      }
+
       const updatedSensorData = {
         ...data,
-        resistance: clampedResistance
+        resistance: clampedResistance,
+        ldr: rawLdr
       };
 
       setSensor(updatedSensorData);
       const timeStr = new Date().toLocaleTimeString();
       setBandwidth(JSON.stringify(data).length);
 
+      // บันทึกประวัติสำหรับกราฟเส้น (ใช้ chartLdr ที่ปรับแต่งค่าแล้ว)
       setAnalogHistory(prev => [
         ...prev.slice(-19),
         { 
           time: timeStr, 
-          ldr: data.ldr || 0, 
+          ldr: chartLdr, 
           v: data.voltage || 0, 
           r: clampedResistance, 
           i: data.current || 0 
@@ -159,9 +196,9 @@ export default function App() {
       ]);
     });
 
-    // รับการแจ้งเตือนจากระบบ Alert
+    // รับการแจ้งเตือนเพิ่มเติมจาก Backend Socket
     socket.on('sensor_alert', (alertData) => {
-      setAlerts(prev => [alertData, ...prev.slice(0, 9)]);
+      setAlerts(prev => [alertData, ...prev.slice(0, 19)]);
     });
 
     return () => {
@@ -175,6 +212,7 @@ export default function App() {
   // ฟังก์ชันล้างค่าการแจ้งเตือน (Clear Alerts)
   const handleClearAlerts = () => {
     setAlerts([]);
+    setShowAlertMenu(false);
   };
 
   // ระบบเข้าสู่ระบบ / ลงทะเบียน
@@ -236,11 +274,95 @@ export default function App() {
   return (
     <div className={`min-h-screen p-4 transition-colors duration-200 ${darkMode ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-800'}`}>
       
-      {/* HEADER BAR */}
+      {/* HEADER / NAVBAR */}
       <div className={`flex flex-wrap justify-between items-center p-4 rounded-lg shadow-md mb-4 ${darkMode ? 'bg-gray-800' : 'bg-white'}`}>
         <h1 className="text-xl font-bold">My Dashboard (WiFi Mode)</h1>
         
         <div className="flex items-center gap-3">
+          
+          {/* BELL ICON & ALERT POPUP DROPDOWN */}
+          <div className="relative" ref={alertMenuRef}>
+            <button
+              onClick={() => setShowAlertMenu(!showAlertMenu)}
+              className={`p-2 rounded-lg border relative transition-colors ${
+                darkMode 
+                  ? 'border-gray-600 hover:bg-gray-700 bg-gray-800' 
+                  : 'border-gray-300 hover:bg-gray-100 bg-white'
+              }`}
+              title="System Notifications"
+            >
+              <span className="text-lg">🔔</span>
+              {alerts.length > 0 && (
+                <span className="absolute -top-1.5 -right-1.5 bg-red-600 text-white text-[10px] font-extrabold rounded-full h-5 w-5 flex items-center justify-center animate-pulse shadow-md">
+                  {alerts.length > 99 ? '99+' : alerts.length}
+                </span>
+              )}
+            </button>
+
+            {/* POPUP MENU */}
+            {showAlertMenu && (
+              <div className={`absolute right-0 mt-2 w-80 sm:w-96 rounded-xl shadow-2xl border z-50 overflow-hidden ${
+                darkMode ? 'bg-gray-800 border-gray-700 text-white' : 'bg-white border-gray-200 text-gray-900'
+              }`}>
+                <div className={`p-3 flex justify-between items-center border-b ${darkMode ? 'border-gray-700 bg-gray-800/80' : 'border-gray-100 bg-gray-50'}`}>
+                  <div className="flex items-center gap-2">
+                    <span className="font-bold text-sm">Notifications</span>
+                    {alerts.length > 0 && (
+                      <span className="px-2 py-0.5 text-xs rounded-full bg-red-500/20 text-red-400 font-semibold">
+                        {alerts.length} New
+                      </span>
+                    )}
+                  </div>
+                  {alerts.length > 0 && (
+                    <button
+                      onClick={handleClearAlerts}
+                      className="text-xs px-2.5 py-1 bg-red-600 hover:bg-red-700 text-white font-medium rounded-md transition-colors shadow-sm"
+                    >
+                      Clear All
+                    </button>
+                  )}
+                </div>
+
+                <div className="max-h-80 overflow-y-auto divide-y divide-gray-700/50">
+                  {alerts.length === 0 ? (
+                    <div className="p-6 text-center text-sm text-gray-400">
+                      🔔 No new notifications
+                    </div>
+                  ) : (
+                    alerts.map((al, idx) => (
+                      <div
+                        key={idx}
+                        className={`p-3 text-xs flex justify-between items-start gap-2 transition-colors ${
+                          al.type === 'CRITICAL'
+                            ? 'bg-red-500/10 hover:bg-red-500/20'
+                            : al.type === 'WARNING'
+                            ? 'bg-amber-500/10 hover:bg-amber-500/20'
+                            : 'bg-blue-500/10 hover:bg-blue-500/20'
+                        }`}
+                      >
+                        <div className="flex-1">
+                          <span className={`inline-block font-bold px-1.5 py-0.5 rounded text-[10px] mr-1.5 mb-1 ${
+                            al.type === 'CRITICAL'
+                              ? 'bg-red-600 text-white'
+                              : al.type === 'WARNING'
+                              ? 'bg-amber-500 text-black'
+                              : 'bg-blue-600 text-white'
+                          }`}>
+                            {al.type || 'INFO'}
+                          </span>
+                          <p className="font-medium leading-relaxed break-words">{al.message}</p>
+                        </div>
+                        <span className="text-[10px] text-gray-400 whitespace-nowrap">
+                          {al.timestamp ? new Date(al.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString()}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
           <button 
             onClick={() => setDarkMode(!darkMode)} 
             className="p-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm"
@@ -282,29 +404,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* ALERT NOTIFICATION PANEL WITH CLEAR BUTTON */}
-      {alerts.length > 0 && (
-        <div className="mb-4 space-y-2">
-          <div className="flex justify-between items-center mb-1">
-            <span className="text-sm font-bold text-gray-400">System Alerts ({alerts.length})</span>
-            <button
-              onClick={handleClearAlerts}
-              className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded-md text-xs font-semibold shadow transition-colors"
-            >
-              🗑️ Clear Alerts
-            </button>
-          </div>
-          {alerts.map((al, idx) => (
-            <div key={idx} className={`p-3 rounded-md text-sm font-semibold flex justify-between items-center ${
-              al.type === 'CRITICAL' ? 'bg-red-600 text-white' : al.type === 'WARNING' ? 'bg-amber-500 text-slate-950' : 'bg-blue-600 text-white'
-            }`}>
-              <span>🚨 [{al.type || 'INFO'}] {al.message}</span>
-              <span className="text-xs opacity-80">{al.timestamp ? new Date(al.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString()}</span>
-            </div>
-          ))}
-        </div>
-      )}
-
       {/* ROW 1: GAUGES & LED STATUS */}
       <div className="grid grid-cols-12 gap-4 mb-4">
         <div className={`col-span-12 md:col-span-4 p-4 rounded-lg shadow-md flex flex-col items-center ${darkMode ? 'bg-gray-800' : 'bg-white'}`}>
@@ -343,7 +442,7 @@ export default function App() {
               data={{
                 labels: analogHistory.map(h => h.time),
                 datasets: [
-                  { label: 'LDR Raw', data: analogHistory.map(h => h.ldr), borderColor: '#f59e0b', tension: 0.3 },
+                  { label: 'LDR Safe Scale', data: analogHistory.map(h => h.ldr), borderColor: '#f59e0b', tension: 0.3 },
                   { label: 'Voltage (V)', data: analogHistory.map(h => h.v), borderColor: '#3b82f6', tension: 0.3 },
                   { label: 'Current (mA)', data: analogHistory.map(h => h.i), borderColor: '#10b981', tension: 0.3 }
                 ]
