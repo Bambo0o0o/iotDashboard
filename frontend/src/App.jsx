@@ -24,7 +24,7 @@ const socket = io(SOCKET_URL);
 
 // ================= ANALOG NEEDLE GAUGE COMPONENT =================
 /**
- * @brief คอมโพเนนต์เข็มไมล์จำลอง (Analog Gauge) สำหรับแสดงค่าแรงดันและ ความต้านทาน
+ * @brief คอมโพเนนต์เข็มไมล์จำลอง (Analog Gauge) สำหรับแสดงค่าแรงดันและความต้านทาน
  */
 function AnalogGauge({ value, min = 0, max = 100, unit = '', color = '#3b82f6', darkMode }) {
   const clampedValue = Math.min(Math.max(value, min), max);
@@ -123,13 +123,28 @@ export default function App() {
 
     // รับข้อมูลอัปเดตจากเซนเซอร์
     socket.on('dashboard_update', (data) => {
-      setSensor(data);
+      // 1. จำดัดค่า Resistance ไม่ให้เกิน 10,000 Ohm (10k)
+      const rawResistance = data.resistance || 0;
+      const clampedResistance = Math.min(Math.max(rawResistance, 0), 10000);
+
+      const updatedSensorData = {
+        ...data,
+        resistance: clampedResistance
+      };
+
+      setSensor(updatedSensorData);
       const timeStr = new Date().toLocaleTimeString();
       setBandwidth(JSON.stringify(data).length);
 
       setAnalogHistory(prev => [
         ...prev.slice(-19),
-        { time: timeStr, ldr: data.ldr || 0, v: data.voltage || 0, r: data.resistance || 0, i: data.current || 0 }
+        { 
+          time: timeStr, 
+          ldr: data.ldr || 0, 
+          v: data.voltage || 0, 
+          r: clampedResistance, 
+          i: data.current || 0 
+        }
       ]);
 
       setDigitalHistory(prev => [
@@ -146,7 +161,7 @@ export default function App() {
 
     // รับการแจ้งเตือนจากระบบ Alert
     socket.on('sensor_alert', (alertData) => {
-      setAlerts(prev => [alertData, ...prev.slice(0, 4)]);
+      setAlerts(prev => [alertData, ...prev.slice(0, 9)]);
     });
 
     return () => {
@@ -156,6 +171,11 @@ export default function App() {
       socket.off('sensor_alert');
     };
   }, []);
+
+  // ฟังก์ชันล้างค่าการแจ้งเตือน (Clear Alerts)
+  const handleClearAlerts = () => {
+    setAlerts([]);
+  };
 
   // ระบบเข้าสู่ระบบ / ลงทะเบียน
   const handleAuth = async () => {
@@ -262,15 +282,24 @@ export default function App() {
         </div>
       </div>
 
-      {/* ALERT NOTIFICATION PANEL */}
+      {/* ALERT NOTIFICATION PANEL WITH CLEAR BUTTON */}
       {alerts.length > 0 && (
         <div className="mb-4 space-y-2">
+          <div className="flex justify-between items-center mb-1">
+            <span className="text-sm font-bold text-gray-400">System Alerts ({alerts.length})</span>
+            <button
+              onClick={handleClearAlerts}
+              className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded-md text-xs font-semibold shadow transition-colors"
+            >
+              🗑️ Clear Alerts
+            </button>
+          </div>
           {alerts.map((al, idx) => (
-            <div key={idx} className={`p-3 rounded-md text-sm font-semibold flex justify-between ${
-              al.type === 'CRITICAL' ? 'bg-red-600 text-white' : al.type === 'WARNING' ? 'bg-yellow-500 text-black' : 'bg-blue-500 text-white'
+            <div key={idx} className={`p-3 rounded-md text-sm font-semibold flex justify-between items-center ${
+              al.type === 'CRITICAL' ? 'bg-red-600 text-white' : al.type === 'WARNING' ? 'bg-amber-500 text-slate-950' : 'bg-blue-600 text-white'
             }`}>
-              <span>🚨 [{al.type}] {al.message}</span>
-              <span className="text-xs opacity-75">{new Date(al.timestamp).toLocaleTimeString()}</span>
+              <span>🚨 [{al.type || 'INFO'}] {al.message}</span>
+              <span className="text-xs opacity-80">{al.timestamp ? new Date(al.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString()}</span>
             </div>
           ))}
         </div>
